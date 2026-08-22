@@ -1,10 +1,21 @@
 # dsh-hub
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A520-green.svg)](https://nodejs.org)
+[![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)](#)
+[![dsh](https://img.shields.io/badge/works%20with-DeepSeek%20Harness%20(dsh)-8A2BE2.svg)](https://github.com/deepseek-ai/deepseek-harness)
+
 A [JupyterHub](https://jupyterhub.readthedocs.io)-style multi-user front for
 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) —
 PAM login, one isolated dsh instance per system user, and a cookie-routed
 HTTP/WebSocket proxy. **Zero modifications to dsh**: upstream upgrades and
 per-user plugin installs keep working.
+
+> **中文简介**:[dsh-hub](README.md) 是 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 的多用户网关,思路完全对标
+> JupyterHub:服务器系统账号(PAM)登录,每个用户一个完全隔离的 dsh 实例
+> (独立 uid/gid、独立数据目录、iptables 端口防护),浏览器直接访问
+> `http://<服务器IP>:3080` 即可使用。**不修改 dsh 任何代码**——上游升级、
+> 每用户自行安装插件均不受影响。
 
 ```
 browser ──http://<server-ip>:3080──▶ dsh-hub ──cookie──▶ 127.0.0.1:<port> ──▶ dsh (user A)
