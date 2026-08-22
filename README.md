@@ -20,25 +20,23 @@ browser ──http://<server-ip>:3080──▶ dsh-hub ──cookie──▶ 127
 | Spawner | `dsh web --port <random>` spawned with the user's uid/gid and a per-user `DSH_HOME` |
 | Configurable HTTP proxy | `http-proxy` routes HTTP + WebSocket by session cookie |
 | Idle culler (jupyterhub-idle-culler) | built-in culler, `IDLE_CULL_MS` (0 = never, tmux-style always-on) |
-| Single-user server trusts the hub | dsh's official `--trusted-host` flag — the upstream deployment contract |
+| Single-user server trusts the hub | loopback proxying with SameSite-cookie CSRF protection (JupyterHub's trust split) |
 
-### Trust model (upstream-native)
+### Trust model
 
 dsh's web server enforces a browser trust fence (`Origin`/`Host` authority
-checks) against DNS-rebinding and CSRF. Instead of forging headers, dsh-hub
-spawns each instance with:
+checks) against DNS-rebinding and CSRF. dsh-hub's proxy (default
+`TRUST_MODE=origin-rewrite`) presents itself as a loopback same-origin client:
+Host and Origin are rewritten to the backend's loopback authority, and
+cross-site protection is carried by the hub's `SameSite=Lax` session cookie —
+the same trust split JupyterHub uses between its proxy and single-user servers.
 
-```
-dsh web --port <N> --trusted-host <lan-ip> --trusted-host <extra>...
-```
-
-The proxy then forwards `Host`/`Origin` **untouched**, so the browser ↔ dsh
-trust chain is real end-to-end and dsh's own fence remains the security
-boundary — exactly the deployment shape the flag was designed for. The hub's
-`SameSite=Lax` cookie adds the cross-site protection on top.
-
-For dsh versions predating `--trusted-host`, set `TRUST_MODE=origin-rewrite`
-to fall back to loopback Host/Origin rewriting at the proxy.
+`TRUST_MODE=trusted-host` spawns instances with dsh's official
+`--trusted-host` flag and forwards Host/Origin untouched. Note: as of current
+dsh, the RPC host empties `trustedHosts` for loopback-authority `/api`
+channels, so this mode only works when the fence actually consumes the flag
+(direct LAN binds). It is kept for future upstream support of proxied
+deployments.
 
 ### Insecure-context polyfill
 
@@ -82,7 +80,7 @@ username/password**, and get a private dsh instance.
 |---|---|---|
 | `DSH_BIN` | *(required)* | dsh CLI entry (built checkout: `apps/cli/lib/bin.js`) |
 | `HUB_HOST` / `HUB_PORT` | `0.0.0.0` / `3080` | hub listen address |
-| `TRUST_MODE` | `trusted-host` | `origin-rewrite` for older dsh |
+| `TRUST_MODE` | `origin-rewrite` | `trusted-host` forwards Host/Origin untouched (see trust model above) |
 | `TRUSTED_HOSTS` | auto (LAN IPv4s) | extra authorities for `--trusted-host` (hostnames/DNS names) |
 | `IDLE_CULL_MS` | `14400000` (4h) | `0` disables culling — backends keep running with the browser closed |
 | `SESSION_TTL_MS` | 7 days | cookie lifetime |

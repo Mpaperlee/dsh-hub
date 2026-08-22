@@ -35,14 +35,17 @@ function int(v, dflt) { const n = Number(v); return Number.isInteger(n) && n > 0
 function intOrZero(v, dflt) { const n = Number(v); return Number.isInteger(n) && n >= 0 ? n : dflt; }
 
 // Trust modes:
-//  - 'trusted-host' (default, upstream-native): spawn dsh with its official
-//    `--trusted-host` flag for every authority browsers may use, and forward
-//    Host/Origin untouched. dsh's own trust fence stays the security boundary,
-//    exactly the deployment shape the flag was designed for.
-//  - 'origin-rewrite' (fallback for dsh versions without the flag): proxy
-//    rewrites Host (changeOrigin) and Origin to loopback; CSRF protection is
-//    carried by the hub's SameSite=Lax cookie instead.
-const TRUST_MODE = process.env.TRUST_MODE === 'origin-rewrite' ? 'origin-rewrite' : 'trusted-host';
+//  - 'origin-rewrite' (default): proxy rewrites Host (changeOrigin) and Origin
+//    to loopback; CSRF protection is carried by the hub's SameSite=Lax cookie.
+//    This is the ONLY mode that works behind a loopback-binding proxy: dsh's
+//    RPC host empties trustedHosts for loopback-authority /api channels
+//    (rpc-host.ts: `authority === 'loopback' ? [] : trustedHosts`), so
+//    --trusted-host cannot grant non-loopback Hosts there.
+//  - 'trusted-host': spawn dsh with its official `--trusted-host` flag and
+//    forward Host/Origin untouched. Only works when the fence actually feeds
+//    the flag to the channel (direct LAN binds), kept for future dsh support
+//    of proxied deployments.
+const TRUST_MODE = process.env.TRUST_MODE === 'trusted-host' ? 'trusted-host' : 'origin-rewrite';
 
 function lanIpv4s() {
   return Object.values(networkInterfaces()).flat()

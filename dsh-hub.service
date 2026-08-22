@@ -9,7 +9,6 @@ Type=simple
 Environment=DSH_BIN=/home/zizhang/scripts/deepseek-harness/apps/cli/lib/bin.js
 Environment=HUB_PORT=3080
 Environment=HUB_LOG_DIR=/var/log/dsh-hub
-# Environment=TRUSTED_HOSTS=hub.example.com
 # Environment=IDLE_CULL_MS=0
 # Environment=ALLOW_USERS=alice,bob
 ExecStart=/home/zizhang/.nvm/versions/node/v22.22.2/bin/node /home/zizhang/dsh-hub/src/index.mjs
