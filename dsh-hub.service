@@ -1,0 +1,28 @@
+[Unit]
+Description=dsh-hub — multi-user front for DeepSeek Harness
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust to your node and dsh locations
+Environment=DSH_BIN=/opt/deepseek-harness/apps/cli/lib/bin.js
+Environment=HUB_PORT=3080
+Environment=HUB_LOG_DIR=/var/log/dsh-hub
+# Environment=TRUSTED_HOSTS=hub.example.com,10.0.0.5
+# Environment=IDLE_CULL_MS=0
+# Environment=ALLOW_USERS=alice,bob
+ExecStart=/usr/bin/node /opt/dsh-hub/src/index.mjs
+Restart=on-failure
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_KILL
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_KILL
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+{
+  "name": "dsh-hub",
+  "version": "0.1.0",
+  "description": "A JupyterHub-style multi-user front for DeepSeek Harness (dsh): PAM auth, per-user isolated dsh instances, cookie-routed HTTP/WebSocket proxy. Zero modifications to dsh.",
+  "type": "module",
+  "main": "src/index.mjs",
+  "scripts": {
+    "start": "node src/index.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "http-proxy": "^1.18.1"
+  },
+  "optionalDependencies": {
+    "authenticate-pam": "^1.0.2"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Mpaperlee/dsh-hub.git"
+  },
+  "keywords": [
+    "deepseek",
+    "dsh",
+    "jupyterhub",
+    "multi-user",
+    "pam",
+    "proxy"
+  ]
+}
