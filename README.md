@@ -56,6 +56,20 @@ localhost). On bare `http://<server-ip>:3080`, dsh-hub injects a self-guarding
 v4-UUID polyfill into every proxied HTML page (a no-op once dsh fixes its
 remaining direct call or you serve over HTTPS).
 
+### Remote settings (the isLoopback gate)
+
+dsh's settings/credentials plane (the Settings → Models page) is browser-gated
+to loopback pages: `connection.isLoopback` is derived from `location.hostname`,
+so a LAN-hostname page reports `settings are unavailable in this browser` even
+though the hub's origin-rewrite already passes the server-side loopback fence.
+`Location` members are `[LegacyUnforgeable]` own accessors — no polyfill can
+spoof them — so dsh-hub instead rewrites the connection plugin bundle in
+flight: `isLoopbackHostname(pageLocation.hostname)` becomes `true`. The patch
+is pattern-based against dsh's unminified bundle, cached per bundle rev, and
+fails loud in the hub log when an upstream upgrade renames the expression.
+Trust stays with the hub: only PAM-authenticated users reach the backend at
+all, and the SameSite=Lax session cookie still blocks cross-site requests.
+
 ## Isolation guarantees (run as root)
 
 - Each dsh instance runs as the user's own **uid/gid** with `DSH_HOME=~/.dsh`

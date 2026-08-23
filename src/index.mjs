@@ -406,6 +406,26 @@ try{Object.defineProperty(crypto,'randomUUID',{value:uuid4,writable:true,configu
 catch(e){try{crypto.randomUUID=uuid4;}catch(e2){}}
 })();</script>`;
 
+// dsh's settings/credentials plane is browser-gated: connection.isLoopback is
+// computed from location.hostname (packages/client/connection), so a page
+// served from a LAN hostname reports "settings are unavailable in this
+// browser" even though the hub's origin-rewrite already passes the server-side
+// loopback fence. Location members are [LegacyUnforgeable] (own non-
+// configurable accessors on the location instance), so no polyfill can spoof
+// them — instead we patch the served connection plugin bundle in flight:
+//
+//   isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),
+//   → isLoopback: true,
+//
+// The trust boundary moves to the hub exactly like origin-rewrite: the PAM
+// session cookie decides who reaches the backend at all. The patch is
+// pattern-based against the unminified bundle and FAILS LOUD (startup log) if
+// upstream renames the expression, so upgrades surface immediately instead of
+// silently regressing settings.
+const CONNECTION_LOOPBACK_PATCH = /isLoopback:[^,\n]*isLoopbackHostname\([^)]*\)/;
+const patchedJsCache = new Map(); // url+etag -> patched body
+let loopbackPatchMissing = false;
+
 const proxy = httpProxy.createProxyServer({
   ws: true,
   // trusted-host mode keeps the browser's real Host so dsh's own fence (fed by
@@ -418,6 +438,38 @@ const proxy = httpProxy.createProxyServer({
 
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const ct = String(proxyRes.headers['content-type'] ?? '');
+  const url = String(req.url ?? '');
+  // Plugin bundles: patch the connection client's isLoopback gate in flight.
+  const isPluginJs = /^\/plugins\/.+\.js(\?|$)/.test(url);
+  if (isPluginJs) {
+    const chunks = [];
+    proxyRes.on('data', (c) => chunks.push(c));
+    proxyRes.on('error', () => res.destroy());
+    proxyRes.on('end', () => {
+      const headers = { ...proxyRes.headers };
+      const cacheKey = `${url}|${String(headers.etag ?? '')}`;
+      const cached = patchedJsCache.get(cacheKey);
+      let body = cached;
+      if (body === undefined) {
+        let js = Buffer.concat(chunks).toString('utf-8');
+        if (CONNECTION_LOOPBACK_PATCH.test(js)) {
+          js = js.replace(CONNECTION_LOOPBACK_PATCH, 'isLoopback: true');
+          console.log(`[hub] patched connection isLoopback gate in ${url.split('?')[0]}`);
+        } else if (/isLoopback/.test(js) && !loopbackPatchMissing) {
+          loopbackPatchMissing = true;
+          console.warn(`[hub] WARNING: ${url.split('?')[0]} mentions isLoopback but the patch pattern did not match — settings will report "unavailable in this browser". Update CONNECTION_LOOPBACK_PATCH for this dsh version.`);
+        }
+        body = Buffer.from(js, 'utf-8');
+        if (patchedJsCache.size > 64) patchedJsCache.clear();
+        patchedJsCache.set(cacheKey, body);
+      }
+      delete headers['content-length'];
+      delete headers['content-encoding'];
+      res.writeHead(proxyRes.statusCode, headers);
+      res.end(body);
+    });
+    return;
+  }
   if (!/text\/html/i.test(ct)) {
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
