@@ -657,7 +657,11 @@ async function route(req, res) {
   if (TRUST_MODE === 'origin-rewrite') {
     // Legacy fallback: align Origin with the loopback Host changeOrigin sends;
     // cross-site protection is carried by the hub's SameSite cookie instead.
-    if (req.headers.origin) req.headers.origin = `http://127.0.0.1:${be.port}`;
+    // Also inject Origin when the browser omitted it entirely (service-worker
+    // or extension re-fetches drop Origin/Sec-Fetch-* headers): plugin guards
+    // like task-board's browser-marker check need one of the two, and this
+    // request already passed the hub's PAM cookie authentication.
+    req.headers.origin = `http://127.0.0.1:${be.port}`;
   }
   // Force identity encoding so the HTML rewrite below sees plain text.
   req.headers['accept-encoding'] = 'identity';
@@ -687,7 +691,7 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
   be.lastActivity = Date.now();
-  if (TRUST_MODE === 'origin-rewrite' && req.headers.origin) {
+  if (TRUST_MODE === 'origin-rewrite') {
     req.headers.origin = `http://127.0.0.1:${be.port}`;
   }
   proxy.ws(req, socket, head, { target: `http://127.0.0.1:${be.port}` });
