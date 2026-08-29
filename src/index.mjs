@@ -669,11 +669,16 @@ function forwardSessionList(be, headers, body) {
 }
 
 function serveCachedSessionList(res, entry) {
-  res.writeHead(entry.status, {
-    'content-type': entry.headers['content-type'] ?? 'application/json',
-    'content-length': entry.body.length,
-  });
-  res.end(entry.body);
+  if (res.destroyed || res.writableEnded) return;
+  try {
+    res.writeHead(entry.status, {
+      'content-type': entry.headers['content-type'] ?? 'application/json',
+      'content-length': entry.body.length,
+    });
+    res.end(entry.body);
+  } catch {
+    /* client already gone — nothing to serve */
+  }
 }
 
 async function revalidateSessionList(user, be, body, key) {
@@ -752,7 +757,16 @@ async function route(req, res) {
     be.lastActivity = Date.now();
     req.headers.origin = `http://127.0.0.1:${be.port}`;
     req.headers['accept-encoding'] = 'identity';
-    const captured = await forwardSessionList(be, req.headers, body);
+    let captured;
+    try {
+      captured = await forwardSessionList(be, req.headers, body);
+    } catch (err) {
+      // Backend died between spawn and forward (cull/restart race): fall back
+      // to the streaming proxy, which re-triggers the spawn-on-demand path.
+      console.error(`[hub] session.list forward failed for ${user}:`, err.message);
+      proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
+      return;
+    }
     if (captured.status === 200) {
       if (rpcCache.size >= RPC_CACHE_MAX) {
         const oldest = rpcCache.keys().next().value;
@@ -765,6 +779,7 @@ async function route(req, res) {
         inflight: false,
       });
     }
+    if (res.destroyed || res.writableEnded) return;
     res.writeHead(captured.status, {
       'content-type': captured.headers['content-type'] ?? 'application/json',
       'content-length': captured.body.length,
