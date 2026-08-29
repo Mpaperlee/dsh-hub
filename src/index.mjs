@@ -610,6 +610,88 @@ const STARTING_PAGE = `<!doctype html><html lang="zh"><head><meta charset="utf-8
 justify-content:center;padding-top:12rem}p{color:#8b97a3}</style></head>
 <body><p>正在为你的账号启动 dsh 实例,首次约需 10 秒,即将自动刷新…</p></body></html>`;
 
+// ------------------------------------------- /api/session.list response cache --
+// dsh's session.list recomputes projections for every session (zstd-decode of
+// large logs + projection apply); on this deployment it routinely takes
+// 25-35s — past the web client's 30s unary timeout, so the sidebar renders no
+// history. This cache keeps the sidebar instant: 10s fresh, then
+// stale-while-revalidate (serve stale up to 30s more while one background
+// revalidation refreshes it). A cached hit never spawns the backend, so idle
+// culling keeps working. Only 200 responses are cached; keys are per user +
+// request-body hash so different payloads never mix.
+const SESSION_LIST_PATH = '/api/session.list';
+const RPC_CACHE_TTL_MS = 10_000;
+const RPC_CACHE_SWR_MS = 30_000;
+const rpcCache = new Map(); // key -> { status, headers, body, expiresAt, staleUntil, inflight }
+const RPC_CACHE_MAX = 500;
+
+function sessionListCacheKey(user, body) {
+  const hash = crypto.createHash('sha256').update(body).digest('hex').slice(0, 16);
+  return `${user}:session.list:${hash}`;
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function sanitizeForwardHeaders(headers, bePort) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const key = k.toLowerCase();
+    if (['connection', 'transfer-encoding', 'upgrade', 'keep-alive', 'proxy-connection', 'te', 'content-length', 'host'].includes(key)) continue;
+    out[k] = v;
+  }
+  out.host = `127.0.0.1:${bePort}`;
+  return out;
+}
+
+function forwardSessionList(be, headers, body) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port: be.port,
+      method: 'POST',
+      path: SESSION_LIST_PATH,
+      headers: { ...sanitizeForwardHeaders(headers, be.port), 'content-length': body.length, connection: 'close' },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+function serveCachedSessionList(res, entry) {
+  res.writeHead(entry.status, {
+    'content-type': entry.headers['content-type'] ?? 'application/json',
+    'content-length': entry.body.length,
+  });
+  res.end(entry.body);
+}
+
+async function revalidateSessionList(user, be, body, key) {
+  try {
+    const captured = await forwardSessionList(be, { accept: 'application/json', 'content-type': 'application/json' }, body);
+    if (captured.status === 200) {
+      const now = Date.now();
+      rpcCache.set(key, { ...captured, expiresAt: now + RPC_CACHE_TTL_MS, staleUntil: now + RPC_CACHE_TTL_MS + RPC_CACHE_SWR_MS, inflight: false });
+    }
+  } catch (err) {
+    console.error(`[hub] session.list revalidate failed for ${user}:`, err.message);
+    rpcCache.delete(key); // let the next request respawn / refetch cleanly
+  } finally {
+    const entry = rpcCache.get(key);
+    if (entry) entry.inflight = false;
+  }
+}
+
 async function route(req, res) {
   const url = new URL(req.url, 'http://x');
 
@@ -634,6 +716,60 @@ async function route(req, res) {
   }
   if (!lookupUser(user)) {  // account deleted since login
     handleLogout(req, res);
+    return;
+  }
+
+  // Session-list RPC cache: serve cached sidebar payloads without spawning the
+  // backend; refresh stale entries in the background (see block above).
+  if (req.method === 'POST' && url.pathname === SESSION_LIST_PATH) {
+    const body = await readRequestBody(req);
+    const key = sessionListCacheKey(user, body);
+    const entry = rpcCache.get(key);
+    const now = Date.now();
+    if (entry && now < entry.staleUntil) {
+      serveCachedSessionList(res, entry);
+      if (now >= entry.expiresAt && !entry.inflight) {
+        entry.inflight = true;
+        const be = backends.get(user);
+        if (be?.port) {
+          revalidateSessionList(user, be, body, key).catch((err) =>
+            console.error(`[hub] session.list revalidate failed for ${user}:`, err.message));
+        } else {
+          entry.inflight = false;
+        }
+      }
+      return;
+    }
+    // Miss or stale window expired: forward (capturing), cache 200s, respond.
+    let be;
+    try {
+      be = await getOrCreateBackend(user);
+    } catch (err) {
+      console.error(`[hub] spawn failed for ${user}:`, err.message);
+      sendHtml(res, 503, `<pre>dsh-hub: 无法启动你的实例\n${err.message}</pre>`);
+      return;
+    }
+    be.lastActivity = Date.now();
+    req.headers.origin = `http://127.0.0.1:${be.port}`;
+    req.headers['accept-encoding'] = 'identity';
+    const captured = await forwardSessionList(be, req.headers, body);
+    if (captured.status === 200) {
+      if (rpcCache.size >= RPC_CACHE_MAX) {
+        const oldest = rpcCache.keys().next().value;
+        if (oldest !== undefined) rpcCache.delete(oldest);
+      }
+      rpcCache.set(key, {
+        ...captured,
+        expiresAt: now + RPC_CACHE_TTL_MS,
+        staleUntil: now + RPC_CACHE_TTL_MS + RPC_CACHE_SWR_MS,
+        inflight: false,
+      });
+    }
+    res.writeHead(captured.status, {
+      'content-type': captured.headers['content-type'] ?? 'application/json',
+      'content-length': captured.body.length,
+    });
+    res.end(captured.body);
     return;
   }
 
