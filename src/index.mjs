@@ -331,8 +331,19 @@ async function getOrCreateBackend(user) {
     TERM: 'xterm-256color',
   };
 
+  // Per-user default workspace: if ~/.dsh/hub-default-workspace names an
+  // existing directory, spawn the backend there instead of home. The dsh web
+  // sidebar is workspace-scoped, so landing in the user's data workspace makes
+  // their sessions visible immediately (no directory-picker navigation, which
+  // cannot traverse home symlinks).
+  let cwd = home;
+  try {
+    const dflt = fs.readFileSync(path.join(home, '.dsh', 'hub-default-workspace'), 'utf8').trim();
+    if (dflt && fs.statSync(dflt).isDirectory()) cwd = dflt;
+  } catch { /* no default workspace configured — keep home */ }
+
   const opts = {
-    cwd: home,
+    cwd,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   };
