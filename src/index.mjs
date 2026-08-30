@@ -364,6 +364,7 @@ async function getOrCreateBackend(user) {
 
   be.ready = waitTcp(port, CFG.spawnTimeoutMs).finally(() => { be.starting = false; });
   await be.ready;
+  prewarmSessionList(user, be); // warm the session-list cache before the browser asks
   return be;
 }
 
@@ -626,10 +627,84 @@ const RPC_CACHE_REVALIDATE_MS = 10_000;   // min gap between background refreshe
 const RPC_CACHE_FAIL_BACKOFF_MS = 30_000; // pause after a failed refresh
 const rpcCache = new Map(); // key -> { status, headers, body, nextRevalidateAt, inflight }
 const RPC_CACHE_MAX = 500;
+const prewarmInflight = new Set();
+// Cache survives hub restarts: entries persist under <hub>/cache/session-list-<hash>.json.
+const CACHE_DIR = path.join(__dirname, '..', 'cache');
+const CACHE_PERSIST_GAP_MS = 30_000;      // throttle disk writes per key
+const STANDARD_SESSION_LIST_BODY = Buffer.from(JSON.stringify({
+  type: 'client-request', rpcId: 'hub-prewarm', method: 'session.list', payload: {},
+}));
 
 function sessionListCacheKey(user, body) {
-  const hash = crypto.createHash('sha256').update(body).digest('hex').slice(0, 16);
+  // Hash only the payload (not rpcId), so hub prewarm and browser requests share a key.
+  let payload = body;
+  try {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (parsed !== null && typeof parsed === 'object' && 'payload' in parsed) {
+      payload = Buffer.from(JSON.stringify(parsed.payload));
+    }
+  } catch {
+    /* keep full-body hash */
+  }
+  const hash = crypto.createHash('sha256').update(payload).digest('hex').slice(0, 16);
   return `${user}:session.list:${hash}`;
+}
+
+function cacheFilePathFor(key) {
+  return path.join(CACHE_DIR, `${crypto.createHash('sha256').update(key).digest('hex')}.json`);
+}
+
+function persistCacheEntry(key, entry) {
+  const now = Date.now();
+  if (entry.lastPersistAt !== undefined && now - entry.lastPersistAt < CACHE_PERSIST_GAP_MS) return;
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(cacheFilePathFor(key), JSON.stringify({
+      key,
+      status: entry.status,
+      contentType: entry.headers['content-type'] ?? 'application/json',
+      bodyB64: entry.body.toString('base64'),
+      nextRevalidateAt: entry.nextRevalidateAt,
+    }));
+    entry.lastPersistAt = now;
+  } catch (err) {
+    console.error('[hub] session.list cache persist failed:', err.message);
+  }
+}
+
+function loadPersistedCache() {
+  try {
+    const files = fs.readdirSync(CACHE_DIR).filter((f) => f.endsWith('.json'));
+    files.sort((a, b) => {
+      const sa = fs.statSync(path.join(CACHE_DIR, a)).mtimeMs;
+      const sb = fs.statSync(path.join(CACHE_DIR, b)).mtimeMs;
+      return sa - sb;
+    });
+    const keep = files.slice(-RPC_CACHE_MAX);
+    for (const file of files) {
+      if (!keep.includes(file)) {
+        try { fs.unlinkSync(path.join(CACHE_DIR, file)); } catch { /* best-effort */ }
+      }
+    }
+    for (const file of keep) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, file), 'utf8'));
+        if (typeof raw.key !== 'string' || typeof raw.bodyB64 !== 'string' || raw.status !== 200) continue;
+        rpcCache.set(raw.key, {
+          status: raw.status,
+          headers: { 'content-type': raw.contentType },
+          body: Buffer.from(raw.bodyB64, 'base64'),
+          nextRevalidateAt: raw.nextRevalidateAt ?? 0, // past → revalidate on first hit
+          inflight: false,
+        });
+      } catch (err) {
+        console.error('[hub] session.list cache load failed for', file, err.message);
+      }
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('[hub] session.list cache dir read failed:', err.message);
+  }
+  if (rpcCache.size > 0) console.log(`[hub] loaded ${rpcCache.size} persisted session.list cache entries`);
 }
 
 function readRequestBody(req) {
@@ -688,7 +763,9 @@ async function revalidateSessionList(user, be, body, key) {
   try {
     const captured = await forwardSessionList(be, { accept: 'application/json', 'content-type': 'application/json' }, body);
     if (captured.status === 200) {
-      rpcCache.set(key, { ...captured, nextRevalidateAt: now + RPC_CACHE_REVALIDATE_MS, inflight: false });
+      const entry = { ...captured, nextRevalidateAt: now + RPC_CACHE_REVALIDATE_MS, inflight: false };
+      rpcCache.set(key, entry);
+      persistCacheEntry(key, entry);
     } else {
       const entry = rpcCache.get(key);
       if (entry) entry.nextRevalidateAt = now + RPC_CACHE_FAIL_BACKOFF_MS;
@@ -702,6 +779,16 @@ async function revalidateSessionList(user, be, body, key) {
     const entry = rpcCache.get(key);
     if (entry) entry.inflight = false;
   }
+}
+
+/** Warm the session-list cache right after a backend spawn, without a browser request. */
+function prewarmSessionList(user, be) {
+  const key = sessionListCacheKey(user, STANDARD_SESSION_LIST_BODY);
+  if (rpcCache.has(key) || prewarmInflight.has(key)) return;
+  prewarmInflight.add(key);
+  revalidateSessionList(user, be, STANDARD_SESSION_LIST_BODY, key)
+    .catch((err) => console.error(`[hub] session.list prewarm failed for ${user}:`, err.message))
+    .finally(() => prewarmInflight.delete(key));
 }
 
 async function route(req, res) {
@@ -780,11 +867,13 @@ async function route(req, res) {
         const oldest = rpcCache.keys().next().value;
         if (oldest !== undefined) rpcCache.delete(oldest);
       }
-      rpcCache.set(key, {
+      const entry = {
         ...captured,
         nextRevalidateAt: now + RPC_CACHE_REVALIDATE_MS,
         inflight: false,
-      });
+      };
+      rpcCache.set(key, entry);
+      persistCacheEntry(key, entry);
     }
     if (res.destroyed || res.writableEnded) return;
     res.writeHead(captured.status, {
@@ -825,6 +914,8 @@ async function route(req, res) {
   req.headers['accept-encoding'] = 'identity';
   proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
 }
+
+loadPersistedCache(); // restore session-list cache entries across hub restarts
 
 const server = http.createServer((req, res) => {
   route(req, res).catch((err) => {
