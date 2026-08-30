@@ -634,14 +634,14 @@ justify-content:center;padding-top:12rem}p{color:#8b97a3}</style></head>
 // never empties the sidebar. Only 200 responses are cached; keys are per
 // user + request-body hash so different payloads never mix.
 const SESSION_LIST_PATH = '/api/session.list';
-const RPC_CACHE_REVALIDATE_MS = 10_000;   // min gap between background refreshes
+const RPC_CACHE_REVALIDATE_MS = 60_000;   // min gap between background refreshes (12MB responses; keep the hub event loop free)
 const RPC_CACHE_FAIL_BACKOFF_MS = 30_000; // pause after a failed refresh
 const rpcCache = new Map(); // key -> { status, headers, body, nextRevalidateAt, inflight }
 const RPC_CACHE_MAX = 500;
 const prewarmInflight = new Set();
 // Cache survives hub restarts: entries persist under <hub>/cache/session-list-<hash>.json.
 const CACHE_DIR = path.join(__dirname, '..', 'cache');
-const CACHE_PERSIST_GAP_MS = 30_000;      // throttle disk writes per key
+const CACHE_PERSIST_GAP_MS = 300_000;     // throttle disk writes per key (16MB base64 files; async, off the hot path)
 const STANDARD_SESSION_LIST_BODY = Buffer.from(JSON.stringify({
   type: 'client-request', rpcId: 'hub-prewarm', method: 'session.list', payload: {},
 }));
@@ -668,19 +668,19 @@ function cacheFilePathFor(key) {
 function persistCacheEntry(key, entry) {
   const now = Date.now();
   if (entry.lastPersistAt !== undefined && now - entry.lastPersistAt < CACHE_PERSIST_GAP_MS) return;
-  try {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-    fs.writeFileSync(cacheFilePathFor(key), JSON.stringify({
+  // Async write: a 16MB base64 payload must never block the event loop — the
+  // hub proxies the browser's WebSocket event streams, and a sync disk write
+  // here stalls them long enough to break the app's 3s readiness handshake.
+  entry.lastPersistAt = now;
+  fs.promises.mkdir(CACHE_DIR, { recursive: true })
+    .then(() => fs.promises.writeFile(cacheFilePathFor(key), JSON.stringify({
       key,
       status: entry.status,
       contentType: entry.headers['content-type'] ?? 'application/json',
       bodyB64: entry.body.toString('base64'),
       nextRevalidateAt: entry.nextRevalidateAt,
-    }));
-    entry.lastPersistAt = now;
-  } catch (err) {
-    console.error('[hub] session.list cache persist failed:', err.message);
-  }
+    })))
+    .catch((err) => console.error('[hub] session.list cache persist failed:', err.message));
 }
 
 function loadPersistedCache() {
