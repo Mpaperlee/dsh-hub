@@ -613,16 +613,18 @@ justify-content:center;padding-top:12rem}p{color:#8b97a3}</style></head>
 // ------------------------------------------- /api/session.list response cache --
 // dsh's session.list recomputes projections for every session (zstd-decode of
 // large logs + projection apply); on this deployment it routinely takes
-// 25-35s — past the web client's 30s unary timeout, so the sidebar renders no
-// history. This cache keeps the sidebar instant: 10s fresh, then
-// stale-while-revalidate (serve stale up to 30s more while one background
-// revalidation refreshes it). A cached hit never spawns the backend, so idle
-// culling keeps working. Only 200 responses are cached; keys are per user +
-// request-body hash so different payloads never mix.
+// 40-66s — far past the web client's 30s unary timeout, so the sidebar renders
+// no history whenever the cache is cold. This cache makes the sidebar always
+// instant: once a 200 response exists for a key it is served forever
+// (serve-stale), with one throttled background revalidation refreshing it.
+// A cached hit never spawns the backend, so idle culling keeps working.
+// Revalidation failures keep the stale entry and back off, so a dead backend
+// never empties the sidebar. Only 200 responses are cached; keys are per
+// user + request-body hash so different payloads never mix.
 const SESSION_LIST_PATH = '/api/session.list';
-const RPC_CACHE_TTL_MS = 10_000;
-const RPC_CACHE_SWR_MS = 30_000;
-const rpcCache = new Map(); // key -> { status, headers, body, expiresAt, staleUntil, inflight }
+const RPC_CACHE_REVALIDATE_MS = 10_000;   // min gap between background refreshes
+const RPC_CACHE_FAIL_BACKOFF_MS = 30_000; // pause after a failed refresh
+const rpcCache = new Map(); // key -> { status, headers, body, nextRevalidateAt, inflight }
 const RPC_CACHE_MAX = 500;
 
 function sessionListCacheKey(user, body) {
@@ -682,15 +684,20 @@ function serveCachedSessionList(res, entry) {
 }
 
 async function revalidateSessionList(user, be, body, key) {
+  const now = Date.now();
   try {
     const captured = await forwardSessionList(be, { accept: 'application/json', 'content-type': 'application/json' }, body);
     if (captured.status === 200) {
-      const now = Date.now();
-      rpcCache.set(key, { ...captured, expiresAt: now + RPC_CACHE_TTL_MS, staleUntil: now + RPC_CACHE_TTL_MS + RPC_CACHE_SWR_MS, inflight: false });
+      rpcCache.set(key, { ...captured, nextRevalidateAt: now + RPC_CACHE_REVALIDATE_MS, inflight: false });
+    } else {
+      const entry = rpcCache.get(key);
+      if (entry) entry.nextRevalidateAt = now + RPC_CACHE_FAIL_BACKOFF_MS;
     }
   } catch (err) {
     console.error(`[hub] session.list revalidate failed for ${user}:`, err.message);
-    rpcCache.delete(key); // let the next request respawn / refetch cleanly
+    // Keep serving the stale snapshot; back off so a dead backend is not hammered.
+    const entry = rpcCache.get(key);
+    if (entry) entry.nextRevalidateAt = now + RPC_CACHE_FAIL_BACKOFF_MS;
   } finally {
     const entry = rpcCache.get(key);
     if (entry) entry.inflight = false;
@@ -724,16 +731,16 @@ async function route(req, res) {
     return;
   }
 
-  // Session-list RPC cache: serve cached sidebar payloads without spawning the
-  // backend; refresh stale entries in the background (see block above).
+  // Session-list RPC cache: serve the last known snapshot forever (serve-stale),
+  // refresh it in the background on a throttle (see block above).
   if (req.method === 'POST' && url.pathname === SESSION_LIST_PATH) {
     const body = await readRequestBody(req);
     const key = sessionListCacheKey(user, body);
     const entry = rpcCache.get(key);
     const now = Date.now();
-    if (entry && now < entry.staleUntil) {
+    if (entry) {
       serveCachedSessionList(res, entry);
-      if (now >= entry.expiresAt && !entry.inflight) {
+      if (now >= entry.nextRevalidateAt && !entry.inflight) {
         entry.inflight = true;
         const be = backends.get(user);
         if (be?.port) {
@@ -741,11 +748,12 @@ async function route(req, res) {
             console.error(`[hub] session.list revalidate failed for ${user}:`, err.message));
         } else {
           entry.inflight = false;
+          entry.nextRevalidateAt = now + RPC_CACHE_FAIL_BACKOFF_MS;
         }
       }
       return;
     }
-    // Miss or stale window expired: forward (capturing), cache 200s, respond.
+    // No snapshot yet: forward (capturing), cache 200s, respond.
     let be;
     try {
       be = await getOrCreateBackend(user);
@@ -774,8 +782,7 @@ async function route(req, res) {
       }
       rpcCache.set(key, {
         ...captured,
-        expiresAt: now + RPC_CACHE_TTL_MS,
-        staleUntil: now + RPC_CACHE_TTL_MS + RPC_CACHE_SWR_MS,
+        nextRevalidateAt: now + RPC_CACHE_REVALIDATE_MS,
         inflight: false,
       });
     }
