@@ -769,15 +769,28 @@ function serveCachedSessionList(res, entry) {
   }
 }
 
+/** A cacheable session.list payload: non-empty 200 whose envelope parses and carries an items array. */
+function isCacheableSessionList(captured) {
+  if (captured.status !== 200 || captured.body.length === 0) return false;
+  try {
+    const parsed = JSON.parse(captured.body.toString('utf8'));
+    return parsed?.result?.ok === true && Array.isArray(parsed.result.value?.items);
+  } catch {
+    return false;
+  }
+}
+
 async function revalidateSessionList(user, be, body, key) {
   const now = Date.now();
   try {
     const captured = await forwardSessionList(be, { accept: 'application/json', 'content-type': 'application/json' }, body);
-    if (captured.status === 200) {
+    if (isCacheableSessionList(captured)) {
       const entry = { ...captured, nextRevalidateAt: now + RPC_CACHE_REVALIDATE_MS, inflight: false };
       rpcCache.set(key, entry);
       persistCacheEntry(key, entry);
     } else {
+      // Half-started backends answer 200 with an empty/partial body; never
+      // let that clobber a good snapshot — keep the old entry and back off.
       const entry = rpcCache.get(key);
       if (entry) entry.nextRevalidateAt = now + RPC_CACHE_FAIL_BACKOFF_MS;
     }
@@ -873,7 +886,7 @@ async function route(req, res) {
       proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
       return;
     }
-    if (captured.status === 200) {
+    if (isCacheableSessionList(captured)) {
       if (rpcCache.size >= RPC_CACHE_MAX) {
         const oldest = rpcCache.keys().next().value;
         if (oldest !== undefined) rpcCache.delete(oldest);
